@@ -8,6 +8,8 @@ In games with large sound assets the psp 1000 might run out of ram and crash.
 To use this you have to supply your own vnds games.
 
 Games have to be converted before they are playable.
+The converter does have ffmpeg as a dependency.
+
 To convert a game run the following command:
 
 ```bash
@@ -23,6 +25,9 @@ Then on your psp you need to create the following directory:
 Then you put the eboot.pbp in that directory alongside the converted game.
 
 If only 1 game is detected it will automatically launch that one.
+
+**DISCLAMER!!**
+this project is still in pre-release so future updates might break save files
 
 **controls:**
 
