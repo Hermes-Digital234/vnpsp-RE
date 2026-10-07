@@ -197,12 +197,22 @@ def quantize(rgba):
     return indexed.tobytes(), bytes(flat[:CLUT_BYTES]).ljust(CLUT_BYTES, b"\x00")
 
 
+def resize_for_psp(image):
+    """Downscale an image proportionally when either dimension exceeds the PSP limit."""
+    width, height = image.size
+    if width <= TEX_MAX and height <= TEX_MAX:
+        return image, (width, height)
+
+    scale = min(TEX_MAX / width, TEX_MAX / height)
+    new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    return image.resize(new_size, Image.Resampling.LANCZOS), (width, height)
+
+
 def build_bpp(image):
     """Pack a Pillow image into .bpp bytes: header, palette, swizzled pixels."""
     rgba = image.convert("RGBA")  # JPEG has no alpha, so this fills in 255
+    rgba, _ = resize_for_psp(rgba)
     width, height = rgba.size
-    if width > TEX_MAX or height > TEX_MAX:
-        raise ValueError(f"{width}x{height} exceeds the PSP's {TEX_MAX} pixel texture limit")
     tw, th = pow2_at_least(width), pow2_at_least(height)
 
     indices, palette = quantize(rgba)
@@ -268,39 +278,239 @@ def decode_bpp(path):
 def convert_image(src, out):
     """Write out.bpp from an image file (or from an old-format .bpp)."""
     if src.suffix.lower() == BPP_SUFFIX:
-        data = build_bpp(decode_bpp1(src))
+        image = decode_bpp1(src)
+        original_size = image.size
+        data = build_bpp(image)
+        image.close()
     else:
         with Image.open(src) as image:
+            original_size = image.size
             data = build_bpp(image)
+
+    width, height = struct.unpack(BPP_HEADER, data[4:BPP_HEADER_BYTES])[0:2]
     tmp = tmp_path(out)
     tmp.write_bytes(data)
     os.replace(tmp, out)
+    return original_size, (width, height)
 
 
 # ------------------------------------------------------------------------- audio
 
-def convert_audio(src, out, bitrate):
-    """Write out.mp3: 44100 Hz stereo, constant bitrate, no tags.
+def _valid_wav_fmt(fmt):
+    if len(fmt) < 16:
+        return False
+    tag, channels, rate, byte_rate, block_align, bits = struct.unpack_from("<HHIIHH", fmt, 0)
+    if not (1 <= channels <= 64 and 1 <= rate <= 384000):
+        return False
+    if byte_rate == 0 or block_align == 0 or bits == 0:
+        return False
+    return tag in (1, 2, 3, 0x11, 0x16, 0xFFFE) or len(fmt) >= 18
 
-    No Xing header and no ID3 tags, so the file is nothing but audio frames; constant
-    bitrate keeps seeking and looping simple for the PSP's decoder.
-    """
+
+def _find_wav_chunk(data, chunk_id, start):
+    search = start
+    while True:
+        marker = data.find(chunk_id, search)
+        if marker < 0 or marker + 8 > len(data):
+            return None
+        size = struct.unpack_from("<I", data, marker + 4)[0]
+        payload_start = marker + 8
+        available = len(data) - payload_start
+        if available > 0:
+            return marker, size, payload_start, available
+        search = marker + 4
+
+
+def _wav_chunks(data):
+    if len(data) < 12 or data[8:12] != b"WAVE":
+        raise ValueError("WAVE header not found")
+
+    fmt_info = _find_wav_chunk(data, b"fmt ", 12)
+    if fmt_info is None:
+        raise ValueError("WAV fmt chunk not found")
+
+    marker, declared, payload_start, available = fmt_info
+    length = min(declared, available)
+    fmt = data[payload_start:payload_start + length]
+    if not _valid_wav_fmt(fmt):
+        raise ValueError("invalid WAV fmt chunk")
+
+    data_info = _find_wav_chunk(data, b"data", payload_start)
+    if data_info is None:
+        raise ValueError("WAV data chunk not found")
+
+    marker, declared, payload_start, available = data_info
+    if declared == 0 or declared > available:
+        length = available
+    else:
+        length = declared
+        tail = payload_start + declared
+        if tail < len(data):
+            tail_id = data[tail:tail + 4]
+            if tail_id not in {b"LIST", b"JUNK", b"fact", b"cue ", b"smpl", b"INFO", b"id3 ", b"PAD ", b"bext"}:
+                length = available
+
+    audio = data[payload_start:payload_start + length]
+    if not audio:
+        raise ValueError("WAV data chunk is empty")
+
+    fact_info = _find_wav_chunk(data, b"fact", payload_start)
+    fact = None
+    if fact_info is not None:
+        _, declared, fact_start, available = fact_info
+        if 0 < declared <= available:
+            fact = data[fact_start:fact_start + declared]
+
+    return fmt, fact, audio
+
+
+def _wav_pcm_info(fmt):
+    if len(fmt) < 16:
+        return None
+    tag, channels, rate, _byte_rate, _align, bits = struct.unpack_from("<HHIIHH", fmt, 0)
+
+    if tag == 0xFFFE and len(fmt) >= 40:
+        tag = struct.unpack_from("<H", fmt, 24)[0]
+
+    raw_formats = {
+        (1, 8): "u8",
+        (1, 16): "s16le",
+        (1, 24): "s24le",
+        (1, 32): "s32le",
+        (3, 32): "f32le",
+        (3, 64): "f64le",
+    }
+    raw_format = raw_formats.get((tag, bits))
+    if raw_format is None or channels <= 0 or rate <= 0:
+        return None
+    return raw_format, channels, rate
+
+
+def _ffmpeg_error(proc):
+    stderr = proc.stderr.decode("utf-8", "replace").strip()
+    lines = stderr.splitlines()
+    return lines[-1].strip() if lines else f"ffmpeg exit {proc.returncode}"
+
+
+def _encode_args(tmp, bitrate):
+    return [
+        "-vn",
+        "-ac", str(MP3_CHANNELS),
+        "-ar", str(MP3_RATE),
+        "-c:a", MP3_CODEC,
+        "-b:a", bitrate,
+        "-map_metadata", "-1",
+        "-write_xing", "0",
+        "-id3v2_version", "0",
+        "-write_id3v1", "0",
+        "-f", "mp3",
+        str(tmp),
+    ]
+
+
+def _run_ffmpeg(cmd, input_data=None):
+    return subprocess.run(cmd, input=input_data, capture_output=True, text=False)
+
+
+def _repair_wav_bytes(raw):
+    fmt, fact, audio = _wav_chunks(raw)
+    chunks = []
+    for chunk_id, payload in ((b"fmt ", fmt), (b"fact", fact), (b"data", audio)):
+        if payload is None:
+            continue
+        chunks.append(
+            chunk_id +
+            struct.pack("<I", len(payload)) +
+            payload +
+            (b"\x00" if len(payload) & 1 else b"")
+        )
+    body = b"WAVE" + b"".join(chunks)
+    return b"RIFF" + struct.pack("<I", len(body)) + body
+
+
+def convert_audio(src, out, bitrate):
+    """Convert audio to PSP-friendly 44100 Hz stereo MP3."""
     tmp = tmp_path(out)
-    cmd = [FFMPEG, "-y", "-v", "error"]
-    if src.suffix.lower() == A8_SUFFIX:
-        # Old raw format: unsigned 8-bit mono PCM, headerless, so ffmpeg has to be told.
-        cmd += ["-f", "u8", "-ar", str(A8_RATE), "-ac", "1"]
-    cmd += ["-i", str(src), "-vn",
-            "-ac", str(MP3_CHANNELS), "-ar", str(MP3_RATE),
-            "-c:a", MP3_CODEC, "-b:a", bitrate,
-            "-map_metadata", "-1",
-            "-write_xing", "0", "-id3v2_version", "0", "-write_id3v1", "0",
-            "-f", "mp3", str(tmp)]  # -f needed: the .part name hides the format
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        errors = proc.stderr.strip().splitlines()
-        raise RuntimeError(errors[-1].strip() if errors else f"ffmpeg exit {proc.returncode}")
-    os.replace(tmp, out)  # only publish a complete file
+    suffix = src.suffix.lower()
+
+    if suffix == A8_SUFFIX:
+        cmd = [FFMPEG, "-y", "-v", "error", "-f", "u8", "-ar", str(A8_RATE), "-ac", "1", "-i", str(src)]
+        proc = _run_ffmpeg(cmd + _encode_args(tmp, bitrate))
+        if proc.returncode != 0:
+            raise RuntimeError(_ffmpeg_error(proc))
+        os.replace(tmp, out)
+        return
+
+    if suffix != ".wav":
+        cmd = [FFMPEG, "-y", "-v", "error", "-i", str(src)]
+        proc = _run_ffmpeg(cmd + _encode_args(tmp, bitrate))
+        if proc.returncode != 0:
+            raise RuntimeError(_ffmpeg_error(proc))
+        os.replace(tmp, out)
+        return
+
+    raw = src.read_bytes()
+    fmt, _fact, audio = _wav_chunks(raw)
+    pcm = _wav_pcm_info(fmt)
+
+    if pcm is not None:
+        raw_format, channels, rate = pcm
+        cmd = [
+            FFMPEG, "-y", "-v", "error",
+            "-f", raw_format,
+            "-ar", str(rate),
+            "-ac", str(channels),
+            "-i", "pipe:0",
+        ] + _encode_args(tmp, bitrate)
+        proc = _run_ffmpeg(cmd, audio)
+        if proc.returncode == 0:
+            os.replace(tmp, out)
+            return
+
+    direct_cmd = [
+        FFMPEG, "-y", "-v", "error",
+        "-ignore_length", "1",
+        "-probesize", "100M",
+        "-analyzeduration", "100M",
+        "-i", str(src),
+    ] + _encode_args(tmp, bitrate)
+    proc = _run_ffmpeg(direct_cmd)
+    if proc.returncode == 0:
+        os.replace(tmp, out)
+        return
+    direct_error = _ffmpeg_error(proc)
+
+    repaired = _repair_wav_bytes(raw)
+    repair_path = src.with_name(src.name + ".repaired.wav.part")
+    repair_path.write_bytes(repaired)
+    try:
+        repaired_cmd = [
+            FFMPEG, "-y", "-v", "error",
+            "-ignore_length", "1",
+            "-probesize", "100M",
+            "-analyzeduration", "100M",
+            "-i", str(repair_path),
+        ] + _encode_args(tmp, bitrate)
+        proc = _run_ffmpeg(repaired_cmd)
+        if proc.returncode == 0:
+            os.replace(tmp, out)
+            return
+        repaired_error = _ffmpeg_error(proc)
+    finally:
+        try:
+            repair_path.unlink()
+        except OSError:
+            pass
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+    tag, channels, rate, _byte_rate, _align, bits = struct.unpack_from("<HHIIHH", fmt, 0)
+    raise RuntimeError(
+        f"WAV decode failed (format 0x{tag:04X}, {rate} Hz, {channels} ch, {bits} bit): "
+        f"{repaired_error}; direct: {direct_error}"
+    )
 
 
 def mp3_is_ready(path):
@@ -400,8 +610,12 @@ def convert_one(kind, src, game_dir, args, claimed):
             if in_place and args.keep_sources:
                 keep_original(src)
             if kind == IMAGE:
-                convert_image(src, out)
-                status, detail = "OK", f"8 bpp, swizzled{', upgraded in place' if in_place else ''}"
+                original_size, output_size = convert_image(src, out)
+                if original_size != output_size:
+                    size_detail = f", downscaled {original_size[0]}x{original_size[1]} -> {output_size[0]}x{output_size[1]}"
+                else:
+                    size_detail = ""
+                status, detail = "OK", f"8 bpp, swizzled{size_detail}{', upgraded in place' if in_place else ''}"
             else:
                 convert_audio(src, out, args.bitrate)
                 status, detail = "OK", f"{MP3_RATE} Hz stereo mp3 {args.bitrate}{', re-encoded in place' if in_place else ''}"
