@@ -2,6 +2,8 @@
 A vnds interpreter for the sony psp.
 
 This interpreter works on 64mb psp's and ppsspp.
+If ppsspp keeps crashing while skipping, disable fast memory access.
+
 I have not tested with a real psp 1000 but it worked in ppsspp with 32mb's of ram.
 In games with large sound assets the psp 1000 might run out of ram and crash.
 
