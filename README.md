@@ -24,10 +24,16 @@ Then you put the eboot.pbp in that directory alongside the converted game.
 
 If only 1 game is detected it will automatically launch that one.
 
-controls:
+**controls:**
+
 cross = next line / select
+
 circle = cancel
+
 square = backlog
+
 triangle = fastforward
+
 L = d-pad down
+
 R = next line / select
