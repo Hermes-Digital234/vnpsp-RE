@@ -24,7 +24,7 @@ Then on your psp you need to create the following directory:
 /PSP/GAME/vnds-RE/
 ```
 
-Then you put the eboot.pbp in that directory alongside the converted game.
+Then you put the eboot.pbp in that directory alongside the folder with converted game inside.
 
 If only 1 game is detected it will automatically launch that one.
 
