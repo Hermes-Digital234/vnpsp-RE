@@ -1,46 +1,56 @@
 # vnpsp-RE
-A vnds interpreter for the sony psp.
 
-This interpreter works on 64mb psp's and ppsspp.
-If ppsspp keeps crashing while skipping, disable fast memory access.
+A VNDS (Visual Novel DS) interpreter for the Sony PSP. Play VNDS visual novels on a PSP, PPSSPP, or a PS Vita running Adrenaline.
 
-I have not tested with a real psp 1000 but it worked in ppsspp with 32mb's of ram.
-In games with large sound assets the psp 1000 might run out of ram and crash.
+**Status:** pre-release. The current build is closed source. The asset converter is open source.
 
-To use this you have to supply your own vnds games.
+## Compatibility
 
-Games have to be converted before they are playable.
-The converter does have ffmpeg as a dependency.
+| Platform | Status |
+|----------|--------|
+| PPSSPP | Works. add it as homebrew, not as a game |
+| PSP slim/3000/Go/Street (64 MB, custom firmware) | Works |
+| PS Vita (via Adrenaline) | Works |
+| PSP-1000 (32 MB) | Currently untested. Audio-heavy games may run out of memory and crash. |
 
-To convert a game run the following command:
+If PPSSPP crashes while skipping text, turn off Fast Memory Access in its settings.
 
-```bash
-python convert_assets.py <path to game directory>
+## What you need
+
+- A device from the table above
+- Your own VNDS game files. No games are included, and none are linked here.
+- Python 3 and ffmpeg (on your PATH) to run the converter
+
+## Setup
+
+1. Convert your game:
 ```
-
-Then on your psp you need to create the following directory:
-
+   python convert_assets.py <path to game directory>
 ```
-/PSP/GAME/vnds-RE/
-```
+2. On your PSP, create the folder `/PSP/GAME/vnds-RE/`.
+3. Copy `EBOOT.PBP` (from the releases page) into that folder, alongside the folder with the converted game.
+4. Launch it. If only one game is found, it starts automatically.
 
-Then you put the eboot.pbp in that directory alongside the folder with converted game inside.
+## Controls
 
-If only 1 game is detected it will automatically launch that one.
+| Button | Action |
+|--------|--------|
+| Cross | Next line / select |
+| Circle | Cancel |
+| Square | Backlog |
+| Triangle | Fast forward |
+| L | D-pad down |
+| R | Next line / select |
 
-**DISCLAMER!!**
-this project is still in pre-release so future updates might break save files
+*L/R were added to play with a psp go while its closed
 
-**controls:**
+## Notes
 
-cross = next line / select
+- Updates during pre-release may break save files.
+- Found a bug? Please open an issue and say which device or emulator you used and which game.
+- Bug fixes are welcome as pull requests, but please open an issue first. I'm not accepting new feature PRs for now.
+- License: BSD 2-Clause (see `LICENSE`).
 
-circle = cancel
+## Development
 
-square = backlog
-
-triangle = fastforward
-
-L = d-pad down
-
-R = next line / select
+The current pre-release was written for myself, just to get things working, which is why its source is still closed. I'm now rewriting it from scratch on the `Rewrite` branch (BSD 2-Clause) with the goal of making it clean, expandable and easy to port to other platforms. The rewrite doesn't run yet, so use the pre-release from the releases page for now.
